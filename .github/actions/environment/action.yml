@@ -1,0 +1,187 @@
+name: Manage a Paiziq environment
+description: Validate Terraform, manage one environment, and deploy its initial applications.
+inputs:
+  environment:
+    description: Fixed dev or prod environment
+    required: true
+  operation:
+    description: create or destroy
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Check workflow configuration
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+        OPERATION: ${{ inputs.operation }}
+      run: |
+        set -euo pipefail
+        test "$GITHUB_REF" = refs/heads/main
+        case "$TARGET" in dev|prod) ;; *) exit 1 ;; esac
+        case "$OPERATION" in create|destroy) ;; *) exit 1 ;; esac
+        for name in ARM_CLIENT_ID ARM_TENANT_ID ARM_SUBSCRIPTION_ID TF_STATE_STORAGE_ACCOUNT TF_STATE_CONTAINER TF_VAR_sdk_ci_principal_id; do
+          if [ -z "${!name:-}" ]; then
+            echo "Missing $name. The subscription Owner must run scripts/bootstrap.sh first." >&2
+            exit 1
+          fi
+        done
+    - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+      with:
+        terraform_version: 1.16.5
+        terraform_wrapper: false
+    - name: Validate configuration and lifecycle tests
+      shell: bash
+      run: make check
+    - name: Check out backend
+      if: inputs.operation == 'create'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: paiziq-admin/Paiziq-sdk
+        ref: main
+        path: .sources/sdk
+        persist-credentials: false
+    - name: Check out dashboard
+      if: inputs.operation == 'create'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: paiziq-admin/Paiziq-Dashboard
+        ref: main
+        path: .sources/dashboard
+        persist-credentials: false
+    - if: inputs.operation == 'create'
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: '22.22'
+        cache: npm
+        cache-dependency-path: .sources/dashboard/package-lock.json
+    - name: Build and check application sources before changing Azure
+      if: inputs.operation == 'create'
+      shell: bash
+      run: |
+        set -euo pipefail
+        npm ci --prefix .sources/dashboard
+        npm run check --prefix .sources/dashboard
+        sdk_sha="$(git -C .sources/sdk rev-parse HEAD)"
+        dashboard_sha="$(git -C .sources/dashboard rev-parse HEAD)"
+        printf 'TF_VAR_backend_image_tag=%s\n' "$sdk_sha" >> "$GITHUB_ENV"
+        printf 'TF_VAR_deployment_revision=infra-%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+        printf 'SDK_COMMIT=%s\nDASHBOARD_COMMIT=%s\n' "$sdk_sha" "$dashboard_sha" >> "$GITHUB_ENV"
+        make -C .sources/sdk/files/paiziq docker-smoke \
+          DOCKER_IMAGE="paiziq-ingest:$sdk_sha" PAIZIQ_CORS_ORIGINS=https://example.invalid
+    - uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
+      with:
+        client-id: ${{ env.ARM_CLIENT_ID }}
+        tenant-id: ${{ env.ARM_TENANT_ID }}
+        subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+    - name: Check subscription and initialize isolated remote state
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+        OPERATION: ${{ inputs.operation }}
+      run: |
+        set -euo pipefail
+        state="$(az rest --method get --url "https://management.azure.com/subscriptions/$ARM_SUBSCRIPTION_ID?api-version=2022-12-01" --query state -o tsv)"
+        if [ "$OPERATION" = create ] && [ "$state" != Enabled ]; then
+          echo "Subscription state is $state; restore it before changing infrastructure." >&2
+          exit 1
+        fi
+        az extension add --name containerapp --upgrade --only-show-errors
+        terraform init -reconfigure -input=false \
+          -backend-config=resource_group_name=paiziq-infra \
+          -backend-config="storage_account_name=$TF_STATE_STORAGE_ACCOUNT" \
+          -backend-config="container_name=$TF_STATE_CONTAINER" \
+          -backend-config="key=$TARGET.tfstate" \
+          -backend-config=use_oidc=true \
+          -backend-config=use_azuread_auth=true
+    - name: Adopt matching existing resources and preserve runtime keys
+      if: inputs.operation == 'create'
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+      run: python3 scripts/lifecycle.py adopt "$TARGET"
+    - name: Bootstrap registry for the real backend image
+      if: inputs.operation == 'create'
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        # Intentional targeted bootstrap: Container Apps cannot be created before
+        # a private image exists. The next step applies the complete config.
+        python3 scripts/lifecycle.py foundation "$TARGET"
+        registry="$(terraform output -raw registry_name)"
+        server="$(terraform output -raw registry_server)"
+        az acr login --name "$registry" --only-show-errors
+        docker tag "paiziq-ingest:$SDK_COMMIT" "$server/paiziq-ingest:$SDK_COMMIT"
+        docker push "$server/paiziq-ingest:$SDK_COMMIT"
+    - name: Apply complete environment without overlapping database writers
+      if: inputs.operation == 'create'
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+      run: python3 scripts/lifecycle.py apply "$TARGET"
+    - name: Get dashboard deployment token
+      if: inputs.operation == 'create'
+      id: dashboard-token
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        token="$(az staticwebapp secrets list --name "paiziq-dashboard-$TARGET" --resource-group "paiziq-$TARGET" --query properties.apiKey --output tsv --only-show-errors)"
+        test -n "$token"
+        echo "::add-mask::$token"
+        printf 'token=%s\n' "$token" >> "$GITHUB_OUTPUT"
+    - name: Publish dashboard
+      if: inputs.operation == 'create'
+      uses: Azure/static-web-apps-deploy@4d27395796ac319302594769cfe812bd207490b1 # v1
+      with:
+        azure_static_web_apps_api_token: ${{ steps.dashboard-token.outputs.token }}
+        action: upload
+        app_location: .sources/dashboard/dist
+        output_location: ''
+        skip_app_build: true
+        skip_api_build: true
+        production_branch: main
+    - name: Verify hosted backend and dashboard
+      if: inputs.operation == 'create'
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        backend="$(terraform output -raw backend_url)"
+        dashboard="$(terraform output -raw dashboard_url)"
+        success=false
+        for attempt in $(seq 1 60); do
+          if make -C .sources/sdk/files/paiziq ci-smoke PAIZIQ_ENDPOINT="$backend" PAIZIQ_DASHBOARD_URL="$dashboard"; then
+            success=true
+            break
+          fi
+          sleep 5
+        done
+        test "$success" = true
+        curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 --max-time 20 "$dashboard/" >/dev/null
+        {
+          printf '### %s environment\n\n' "$TARGET"
+          printf 'Resource group: `paiziq-%s`\n\n' "$TARGET"
+          printf 'Dashboard: %s\n\nBackend: %s\n\nHealth: %s/health\n\n' "$dashboard" "$backend" "$backend"
+          printf 'SDK commit: `%s`\n\nDashboard commit: `%s`\n\n' "$SDK_COMMIT" "$DASHBOARD_COMMIT"
+          if [ "$TARGET" = dev ]; then
+            printf 'After recreation, run `scripts/configure-app-repos.sh` locally to refresh the dashboard repository deployment token.\n'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Delete the entire environment and verify the group is absent
+      if: inputs.operation == 'destroy'
+      shell: bash
+      env:
+        TARGET: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        python3 scripts/lifecycle.py destroy "$TARGET"
+        printf '### Cleanup complete\n\nVerified `paiziq-%s` is deleted, including its application resources and data. Its Terraform state is empty.\n' "$TARGET" >> "$GITHUB_STEP_SUMMARY"
+    - name: Remove local sensitive temporary files
+      if: always()
+      shell: bash
+      run: rm -f .adopted.auto.tfvars.json environment.tfplan

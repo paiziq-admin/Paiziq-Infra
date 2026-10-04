@@ -1,0 +1,32 @@
+name: Spin up dev
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: paiziq-dev-lifecycle
+  cancel-in-progress: false
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: dev
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: 'true'
+      ARM_USE_AZUREAD: 'true'
+      TF_IN_AUTOMATION: 'true'
+      TF_STATE_STORAGE_ACCOUNT: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+      TF_STATE_CONTAINER: ${{ vars.TF_STATE_CONTAINER }}
+      TF_VAR_sdk_ci_principal_id: ${{ vars.SDK_CI_PRINCIPAL_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/environment
+        with:
+          environment: dev
+          operation: create
