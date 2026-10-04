@@ -126,6 +126,66 @@ class DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "concurrent SQLite"):
             lifecycle.Lifecycle("dev", run, lambda _: None).stop_backend()
 
+class AdoptionTests(unittest.TestCase):
+    def test_preserves_runtime_keys_in_private_temporary_file(self):
+        import os
+        import secrets
+        import stat
+        import tempfile
+        from unittest.mock import patch
+        subscription = "00000000-0000-4000-8000-000000000001"
+        base = f"/subscriptions/{subscription}/resourceGroups/paiziq-dev"
+        ingest, encryption = secrets.token_urlsafe(36), secrets.token_urlsafe(32)
+        imports = []
+
+        def run(*args, capture=False):
+            if args[:3] == ("terraform", "show", "-json"):
+                return "{}"
+            if args[:3] == ("az", "group", "exists"):
+                return "true"
+            if args[:3] == ("az", "resource", "list"):
+                return json.dumps([{"id": base + "/providers/Microsoft.App/containerApps/paiziq-ingest-dev"}])
+            if args[:4] == ("az", "containerapp", "secret", "list"):
+                return json.dumps([{"name": "ingest-keys", "value": ingest}, {"name": "secrets-key", "value": encryption}])
+            if args[:4] == ("az", "role", "assignment", "list"):
+                return "[]"
+            if args[:3] == ("terraform", "state", "list"):
+                return ""
+            if args[:2] == ("terraform", "import"):
+                imports.append(args)
+                return ""
+            raise AssertionError(args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            secret_file = Path(directory) / "adoption.json"
+            with patch.object(lifecycle, "SECRET_FILE", secret_file), patch.dict(os.environ, {"ARM_SUBSCRIPTION_ID": subscription, "GITHUB_ACTIONS": "false"}):
+                lifecycle.Lifecycle("dev", run).adopt()
+                self.assertEqual(json.loads(secret_file.read_text()), {"existing_ingest_keys": ingest, "existing_secrets_key": encryption})
+                self.assertEqual(stat.S_IMODE(secret_file.stat().st_mode), 0o600)
+                self.assertEqual(len(imports), 2)
+                for call in imports:
+                    self.assertNotIn(ingest, " ".join(call))
+                    self.assertNotIn(encryption, " ".join(call))
+
+    def test_role_assignment_in_other_group_is_rejected(self):
+        state = {"values": {"root_module": {"resources": [{
+            "type": "azurerm_role_assignment", "values": {
+                "id": "/subscriptions/example/providers/Microsoft.Authorization/roleAssignments/role",
+                "scope": "/subscriptions/example/resourceGroups/paiziq-prod"}}]}}}
+        from unittest.mock import patch
+        with patch.dict(lifecycle.os.environ, {"ARM_SUBSCRIPTION_ID": "example"}):
+            with self.assertRaisesRegex(RuntimeError, "Wrong environment"):
+                lifecycle.Lifecycle("dev", lambda *args, **kw: json.dumps(state)).verify_state()
+
+    def test_state_in_other_subscription_is_rejected(self):
+        from unittest.mock import patch
+        state = {"values": {"root_module": {"resources": [{
+            "type": "azurerm_resource_group", "values": {
+                "name": "paiziq-dev", "id": "/subscriptions/other/resourceGroups/paiziq-dev"}}]}}}
+        with patch.dict(lifecycle.os.environ, {"ARM_SUBSCRIPTION_ID": "current"}):
+            with self.assertRaisesRegex(RuntimeError, "Wrong subscription"):
+                lifecycle.Lifecycle("dev", lambda *args, **kw: json.dumps(state)).verify_state()
+
 
 if __name__ == "__main__":
     unittest.main()
