@@ -2,7 +2,8 @@ locals {
   group_name   = "paiziq-${var.environment}"
   registry     = "paiziq${var.environment}acr8406cce0"
   storage      = var.environment == "dev" ? "paiziqdevdata8406cce02" : "paiziqproddata8406cce0"
-  backend_name = "paiziq-ingest-${var.environment}"
+  backend_name = var.environment == "dev" ? "paiziq-ingest-dev-recovery" : "paiziq-ingest-prod"
+  backend_env  = var.environment == "dev" ? "paiziq-dev-env-recovery-eastus2" : "paiziq-prod-env-eastus2"
   tags         = { application = "paiziq", environment = var.environment, managed_by = "terraform" }
 }
 resource "azurerm_resource_group" "environment" {
@@ -34,7 +35,7 @@ resource "azurerm_storage_share" "data" {
   quota              = 5
 }
 resource "azurerm_container_app_environment" "backend" {
-  name                = "paiziq-${var.environment}-env-eastus2"
+  name                = local.backend_env
   resource_group_name = azurerm_resource_group.environment.name
   location            = "eastus2"
   # Consumption only: no dedicated nodes, VNet or paid log workspace.

@@ -115,7 +115,7 @@ class DeploymentTests(unittest.TestCase):
             if args[:3] == ("az", "group", "exists"):
                 return "true"
             if args[:3] == ("az", "resource", "list"):
-                return '[{"name":"paiziq-ingest-dev","type":"Microsoft.App/containerApps"}]'
+                return '[{"name":"paiziq-ingest-dev-recovery","type":"Microsoft.App/containerApps"}]'
             if args[:4] == ("az", "containerapp", "revision", "list"):
                 return '[{"name":"old","properties":{"active":true}}]'
             if args[:4] == ("az", "containerapp", "revision", "deactivate"):
@@ -144,7 +144,7 @@ class AdoptionTests(unittest.TestCase):
             if args[:3] == ("az", "group", "exists"):
                 return "true"
             if args[:3] == ("az", "resource", "list"):
-                return json.dumps([{"id": base + "/providers/Microsoft.App/containerApps/paiziq-ingest-dev"}])
+                return json.dumps([{"id": base + "/providers/Microsoft.App/containerApps/paiziq-ingest-dev-recovery"}])
             if args[:4] == ("az", "containerapp", "secret", "list"):
                 return json.dumps([{"name": "ingest-keys", "value": ingest}, {"name": "secrets-key", "value": encryption}])
             if args[:4] == ("az", "role", "assignment", "list"):

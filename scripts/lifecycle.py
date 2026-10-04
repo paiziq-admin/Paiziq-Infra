@@ -106,8 +106,10 @@ class Lifecycle:
         base = f"/subscriptions/{subscription}/resourceGroups/{self.group}"
         registry = f"paiziq{self.environment}acr8406cce0"
         storage = "paiziqdevdata8406cce02" if self.environment == "dev" else "paiziqproddata8406cce0"
-        env = f"paiziq-{self.environment}-env-eastus2"
-        app = f"paiziq-ingest-{self.environment}"
+        env = ("paiziq-dev-env-recovery-eastus2" if self.environment == "dev"
+               else "paiziq-prod-env-eastus2")
+        app = ("paiziq-ingest-dev-recovery" if self.environment == "dev"
+               else "paiziq-ingest-prod")
         items = json.loads(self.az("resource", "list", "--resource-group", self.group))
         ids = {item["id"].lower(): item["id"] for item in items}
         app_id = f"{base}/providers/Microsoft.App/containerApps/{app}"
@@ -203,7 +205,8 @@ class Lifecycle:
     def stop_backend(self):
         if not self.exists():
             return
-        app = f"paiziq-ingest-{self.environment}"
+        app = ("paiziq-ingest-dev-recovery" if self.environment == "dev"
+               else "paiziq-ingest-prod")
         items = json.loads(self.az("resource", "list", "--resource-group", self.group))
         if not any(i["name"] == app and i["type"].lower() == "microsoft.app/containerapps" for i in items):
             return
